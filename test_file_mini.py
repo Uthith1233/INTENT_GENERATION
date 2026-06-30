@@ -13,6 +13,9 @@ BLOB_ROOTS = [
     DATA_ROOT,
     DATA_ROOT / "v1.0-trainval02",
     DATA_ROOT / "v1.0-trainval03",
+    DATA_ROOT / "v1.0-trainval04",
+    DATA_ROOT / "v1.0-trainval05",
+    DATA_ROOT / "v1.0-trainval06",
 ]
 
 
@@ -38,9 +41,34 @@ TARGET_CATEGORY_PREFIXES = (
 LSTM_WINDOW_NPZ = OUTPUT_DIR / "lstm_trajectory_windows.npz"
 
 LSTM_WINDOW_INDEX_CSV = OUTPUT_DIR / "lstm_traj_window_index.csv"
+SAVE_COMPRESSED_LSTM_NPZ = False
 
 HISTORY_FRAMES = 6
 FUTURE_FRAMES = 4
+
+MAX_NEIGHBORS = 8
+SOCIAL_RADIUS = 12.0
+OBJECT_SOCIAL_RADIUS = 10.0
+MIN_SOCIAL_DISTANCE = 0.25
+NEIGHBOR_FEATURE_COLS = [
+    "neighbor_rel_x",
+    "neighbor_rel_y",
+    "neighbor_distance",
+    "neighbor_speed",
+    "neighbor_acceleration",
+    "neighbor_v_forward",
+    "neighbor_v_lateral",
+    "neighbor_is_vehicle",
+    "neighbor_is_pedestrian",
+    "neighbor_is_object",
+]
+
+FUTURE_FRAMES_BY_LABEL = {
+    "vehicle_cut_in": 6,
+    "vehicle_braking": 12,
+    "pedestrian_crossing": 4,
+    "obstacle_approach": 4,
+}
 
 LSTM_LABELS = [
     "none",
@@ -51,6 +79,7 @@ LSTM_LABELS = [
 ]
 
 # Use only front camera for bbox projection.
+RUN_CAMERA_PROJECTION = False
 CAMERA_CHANNELS = [
     "CAM_FRONT",
 ]
@@ -60,11 +89,10 @@ SAVE_CAMERA_VISUALIZATIONS = True
 MAX_VIS_IMAGES = 200
 
 TARGET_SCENE_NAME = {
-    "scene-0005",
-    "scene-0194",
     "scene-0207",
-    "scene-0289",
-    "scene-0305",
+    "scene-0436",
+    "scene-0479",
+    "scene-0504",
 }
 
 
@@ -753,6 +781,8 @@ MIN_EGO_SPEED_FOR_BRAKING = 2.0
 MAX_BRAKING_HEADING_DIFF = np.deg2rad(35.0)
 TARGET_BRAKES_MORE_THAN_EGO_MARGIN = 0.0
 TARGET_SPEED_DROP_MORE_THAN_EGO_MARGIN = 0.0
+BRAKING_MIN_CLOSING_SPEED = 0.5
+BRAKING_MAX_TTC = 30.0
 
 traj_df["prev_window_max_agent_speed_for_braking"] = (
     track_group["agent_speed"]
@@ -803,6 +833,10 @@ traj_df["vehicle_braking_candidate_frame"] = (
 
     # Vehicle should be ahead of ego and close enough to matter.
     (traj_df["rel_x"].between(BRAKING_MIN_FRONT_X, BRAKING_MAX_FRONT_X)) &
+
+    # Ego should actually be closing on this braking vehicle.
+    (traj_df["closing_speed"] > BRAKING_MIN_CLOSING_SPEED) &
+    (traj_df["ttc"] < BRAKING_MAX_TTC) &
 
     # Ego should be moving, but not be the vehicle doing the braking event.
     (traj_df["ego_speed"] > MIN_EGO_SPEED_FOR_BRAKING) &
@@ -1010,20 +1044,24 @@ track_group = traj_df.groupby(["scene_token","instance_token"],group_keys=False)
 
 for label_name, event_col in event_label_to_col:
     future_col= f"future_{label_name}"
+    future_frames = FUTURE_FRAMES_BY_LABEL.get(label_name, FUTURE_FRAMES)
 
     traj_df[future_col]= (
         track_group[event_col]
-        .transform(lambda s: future_event(s.astype(bool), FUTURE_FRAMES))
+        .transform(lambda s, n=future_frames: future_event(s.astype(bool), n))
         .astype(bool)
     )
-traj_df["future_intent_label"] = "none"
+
+# The training label includes the current event frame plus near-future frames.
+# This gives rare classes like braking some examples with the actual motion cue visible.
+traj_df["future_intent_label"] = traj_df["intent_label"]
 
 for label_name, _ in intent_label_priority:
     future_col = f"future_{label_name}"
 
 
     traj_df.loc[
-        (traj_df["intent_label"] == "none") &
+        (traj_df["future_intent_label"] == "none") &
         (traj_df[future_col]),
         "future_intent_label"
     ] = label_name
@@ -1031,6 +1069,15 @@ for label_name, _ in intent_label_priority:
 traj_df["future_intent_label_id"] = traj_df["future_intent_label"].map(
     {name: idx for idx , name in enumerate(LSTM_LABELS)}
 )
+
+if traj_df["future_intent_label_id"].isna().any():
+    unknown_labels = sorted(traj_df.loc[
+        traj_df["future_intent_label_id"].isna(),
+        "future_intent_label"
+    ].dropna().unique())
+    raise ValueError(f"Unknown future intent labels: {unknown_labels}")
+
+traj_df["future_intent_label_id"] = traj_df["future_intent_label_id"].astype(int)
 
 
 master_label_cols = [
@@ -1105,9 +1152,12 @@ master_label_summary_df.to_csv(MASTER_LABEL_SUMMARY_CSV, index=False)
 # ============================================================
 
 print("\nBuilding LSTM trajectory window dataset...")
+print("Future frames by label:", FUTURE_FRAMES_BY_LABEL)
 
 # Convert inf TTC to a capped numeric value for neural network training.
 MAX_TTC_FOR_MODEL = 10.0
+MAX_JERK_FOR_MODEL = 10.0
+MAX_CLOSING_RATIO_FOR_MODEL = 3.0
 
 traj_df["ttc_clipped"] = traj_df["ttc"].replace([np.inf, -np.inf], MAX_TTC_FOR_MODEL)
 traj_df["ttc_clipped"] = traj_df["ttc_clipped"].clip(0.0, MAX_TTC_FOR_MODEL)
@@ -1122,12 +1172,98 @@ traj_df["is_in_front_float"] = traj_df["is_in_front"].astype(float)
 traj_df["is_same_lane_simple_float"] = traj_df["is_same_lane_simple"].astype(float)
 traj_df["is_adjacent_lane_simple_float"] = traj_df["is_adjacent_lane_simple"].astype(float)
 
+lstm_track_group = traj_df.groupby(["scene_token", "instance_token"], group_keys=False)
+
+traj_df["agent_speed_prev_1"] = (
+    lstm_track_group["agent_speed"].shift(1).fillna(traj_df["agent_speed"])
+)
+traj_df["agent_speed_prev_2"] = (
+    lstm_track_group["agent_speed"].shift(2).fillna(traj_df["agent_speed_prev_1"])
+)
+traj_df["agent_speed_prev_4"] = (
+    lstm_track_group["agent_speed"].shift(4).fillna(traj_df["agent_speed_prev_2"])
+)
+
+traj_df["agent_speed_drop_1"] = traj_df["agent_speed_prev_1"] - traj_df["agent_speed"]
+traj_df["agent_speed_drop_2"] = traj_df["agent_speed_prev_2"] - traj_df["agent_speed"]
+traj_df["agent_speed_drop_4"] = traj_df["agent_speed_prev_4"] - traj_df["agent_speed"]
+
+traj_df["agent_acceleration_prev_1"] = (
+    lstm_track_group["agent_acceleration"].shift(1).fillna(traj_df["agent_acceleration"])
+)
+traj_df["agent_jerk"] = (
+    (traj_df["agent_acceleration"] - traj_df["agent_acceleration_prev_1"])
+    / traj_df["dt"].replace(0.0, np.nan)
+)
+traj_df["agent_jerk"] = (
+    traj_df["agent_jerk"]
+    .replace([np.inf, -np.inf], 0.0)
+    .fillna(0.0)
+    .clip(-MAX_JERK_FOR_MODEL, MAX_JERK_FOR_MODEL)
+)
+
+traj_df["time_gap"] = np.inf
+valid_time_gap = (
+    (traj_df["rel_x"] > 0.0) &
+    (traj_df["ego_speed"] > 0.1)
+)
+traj_df.loc[valid_time_gap, "time_gap"] = (
+    traj_df.loc[valid_time_gap, "rel_x"] / traj_df.loc[valid_time_gap, "ego_speed"]
+)
+traj_df["time_gap_clipped"] = (
+    traj_df["time_gap"]
+    .replace([np.inf, -np.inf], MAX_TTC_FOR_MODEL)
+    .clip(0.0, MAX_TTC_FOR_MODEL)
+)
+traj_df["closing_speed_ratio"] = (
+    traj_df["closing_speed"] / traj_df["ego_speed"].clip(lower=0.1)
+)
+traj_df["closing_speed_ratio"] = (
+    traj_df["closing_speed_ratio"]
+    .replace([np.inf, -np.inf], 0.0)
+    .fillna(0.0)
+    .clip(-MAX_CLOSING_RATIO_FOR_MODEL, MAX_CLOSING_RATIO_FOR_MODEL)
+)
+
+traj_df["relative_acceleration"] = (
+    traj_df["agent_acceleration"] - traj_df["ego_acceleration"]
+)
+
+traj_df["speed_drop_minus_ego"] = (
+    traj_df["braking_window_speed_drop"].fillna(0.0)
+    - traj_df["ego_braking_window_speed_drop"].fillna(0.0)
+)
+
+traj_df["prev_window_max_agent_speed_for_braking"] = (
+    traj_df["prev_window_max_agent_speed_for_braking"].fillna(traj_df["agent_speed"])
+)
+
+traj_df["braking_window_speed_drop"] = traj_df["braking_window_speed_drop"].fillna(0.0)
+traj_df["ego_braking_window_speed_drop"] = traj_df["ego_braking_window_speed_drop"].fillna(0.0)
+traj_df["prev_window_max_lateral_distance"] = (
+    traj_df["prev_window_max_lateral_distance"].fillna(traj_df["lateral_distance"])
+)
+traj_df["window_lateral_decrease"] = traj_df["window_lateral_decrease"].fillna(0.0)
+
+traj_df["target_lateral_motion_toward_center_float"] = (
+    traj_df["target_lateral_motion_toward_center"].astype(float)
+)
+traj_df["pedestrian_lateral_motion_toward_ego_path_float"] = (
+    traj_df["pedestrian_lateral_motion_toward_ego_path"].astype(float)
+)
+traj_df["pedestrian_lateral_motion_dominant_float"] = (
+    traj_df["pedestrian_lateral_motion_dominant"].astype(float)
+)
+
 LSTM_FEATURE_COLS = [
     # ego-relative position
     "rel_x",
     "rel_y",
+    "lateral_distance",
     "distance_2d",
     "yaw_relative_to_ego",
+    "width",
+    "length",
 
     # target motion
     "agent_speed",
@@ -1135,6 +1271,12 @@ LSTM_FEATURE_COLS = [
     "yaw_rate",
     "agent_v_forward",
     "agent_v_lateral",
+    "agent_speed_drop_1",
+    "agent_speed_drop_2",
+    "agent_speed_drop_4",
+    "agent_jerk",
+    "prev_window_max_agent_speed_for_braking",
+    "braking_window_speed_drop",
 
     # ego motion
     "ego_speed",
@@ -1142,12 +1284,24 @@ LSTM_FEATURE_COLS = [
     "ego_v_forward",
     "ego_v_lateral",
     "ego_yaw_rate",
+    "ego_braking_window_speed_drop",
 
     # relational motion
     "relative_v_forward",
     "relative_v_lateral",
+    "relative_acceleration",
     "closing_speed",
+    "closing_speed_ratio",
+    "speed_drop_minus_ego",
     "ttc_clipped",
+    "time_gap_clipped",
+
+    # recent lateral trend
+    "prev_window_max_lateral_distance",
+    "window_lateral_decrease",
+    "target_lateral_motion_toward_center_float",
+    "pedestrian_lateral_motion_toward_ego_path_float",
+    "pedestrian_lateral_motion_dominant_float",
 
     # simple geometry flags
     "is_in_front_float",
@@ -1160,11 +1314,130 @@ LSTM_FEATURE_COLS = [
     "is_object",
 ]
 
+NEIGHBOR_BASE_FEATURE_COLS = [
+    "agent_speed",
+    "agent_acceleration",
+    "agent_v_forward",
+    "agent_v_lateral",
+    "is_vehicle",
+    "is_pedestrian",
+    "is_object",
+]
+
+
+def build_sample_actor_lookup(df):
+    lookup = {}
+
+    for sample_token, group_df in df.groupby("sample_token", sort=False):
+        rel_xy = (
+            group_df[["rel_x", "rel_y"]]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32)
+        )
+        base_features = (
+            group_df[NEIGHBOR_BASE_FEATURE_COLS]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32)
+        )
+
+        lookup[str(sample_token)] = {
+            "instance_tokens": group_df["instance_token"].astype(str).to_numpy(),
+            "rel_x": rel_xy[:, 0],
+            "rel_y": rel_xy[:, 1],
+            "base_features": base_features,
+        }
+
+    return lookup
+
+
+def build_row_neighbor_cache(df, sample_actor_lookup):
+    num_rows = len(df)
+    neighbor_features = np.zeros(
+        (num_rows, MAX_NEIGHBORS, len(NEIGHBOR_FEATURE_COLS)),
+        dtype=np.float32,
+    )
+    neighbor_mask = np.zeros(
+        (num_rows, MAX_NEIGHBORS),
+        dtype=bool,
+    )
+
+    row_sample_tokens = df["sample_token"].astype(str).to_numpy()
+    row_instance_tokens = df["instance_token"].astype(str).to_numpy()
+    row_rel_xy = (
+        df[["rel_x", "rel_y"]]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .to_numpy(dtype=np.float32)
+    )
+
+    for row_idx in range(num_rows):
+        if (row_idx + 1) % 100000 == 0:
+            print(
+                f"Prepared social neighbors for {row_idx + 1}/{num_rows} rows",
+                flush=True,
+            )
+
+        actors_at_time = sample_actor_lookup.get(row_sample_tokens[row_idx])
+
+        if actors_at_time is None:
+            continue
+
+        dx = actors_at_time["rel_x"] - row_rel_xy[row_idx, 0]
+        dy = actors_at_time["rel_y"] - row_rel_xy[row_idx, 1]
+        distance = np.hypot(dx, dy)
+        is_object_neighbor = actors_at_time["base_features"][:, 6] > 0.5
+
+        valid = (
+            (actors_at_time["instance_tokens"] != row_instance_tokens[row_idx])
+            & (distance >= MIN_SOCIAL_DISTANCE)
+            & (distance <= SOCIAL_RADIUS)
+            & (~is_object_neighbor | (distance <= OBJECT_SOCIAL_RADIUS))
+        )
+
+        if not np.any(valid):
+            continue
+
+        valid_indices = np.flatnonzero(valid)
+        valid_distances = distance[valid_indices]
+
+        if len(valid_indices) > MAX_NEIGHBORS:
+            nearest_local = np.argpartition(
+                valid_distances,
+                MAX_NEIGHBORS - 1,
+            )[:MAX_NEIGHBORS]
+            selected_indices = valid_indices[nearest_local]
+            selected_distances = valid_distances[nearest_local]
+            order = np.argsort(selected_distances)
+            selected_indices = selected_indices[order]
+            selected_distances = selected_distances[order]
+        else:
+            order = np.argsort(valid_distances)
+            selected_indices = valid_indices[order]
+            selected_distances = valid_distances[order]
+
+        count = len(selected_indices)
+        neighbor_features[row_idx, :count, 0] = dx[selected_indices]
+        neighbor_features[row_idx, :count, 1] = dy[selected_indices]
+        neighbor_features[row_idx, :count, 2] = selected_distances
+        neighbor_features[row_idx, :count, 3:] = actors_at_time["base_features"][
+            selected_indices
+        ]
+        neighbor_mask[row_idx, :count] = True
+
+    print(f"Prepared social neighbors for {num_rows}/{num_rows} rows", flush=True)
+
+    return neighbor_features, neighbor_mask
+
 
 def build_lstm_windows(df, feature_cols, history_frames):
     X_list = []
     y_list = []
     index_rows = []
+    X_neighbors_list = []
+    neighbor_mask_list = []
+
 
     label_to_id = {name: idx for idx, name in enumerate(LSTM_LABELS)}
 
@@ -1172,10 +1445,17 @@ def build_lstm_windows(df, feature_cols, history_frames):
         ["scene_token", "instance_token", "timestamp_sec"]
     ).reset_index(drop=True)
 
-    grouped = df.groupby(["scene_token", "instance_token"], group_keys=False)
+    sample_actor_lookup = build_sample_actor_lookup(df)
+    row_neighbor_features, row_neighbor_mask = build_row_neighbor_cache(
+        df,
+        sample_actor_lookup,
+    )
 
-    for (scene_token, instance_token), g in grouped:
-        g = g.sort_values("timestamp_sec").reset_index(drop=True)
+    grouped = df.groupby(["scene_token", "instance_token"], group_keys=False, sort=False)
+    total_tracks = grouped.ngroups
+
+    for track_idx, ((scene_token, instance_token), g) in enumerate(grouped, start=1):
+        g = g.sort_values("timestamp_sec")
 
         if len(g) < history_frames:
             continue
@@ -1197,6 +1477,7 @@ def build_lstm_windows(df, feature_cols, history_frames):
         labels = g["future_intent_label"].fillna("none").tolist()
 
         timestamps = g["timestamp_sec"].to_numpy()
+        row_indices = g.index.to_numpy()
 
         for end_idx in range(history_frames - 1, len(g)):
             start_idx = end_idx - history_frames + 1
@@ -1216,6 +1497,10 @@ def build_lstm_windows(df, feature_cols, history_frames):
                 label_name = "none"
 
             X_list.append(feature_array[start_idx:end_idx + 1])
+            window_row_indices = row_indices[start_idx:end_idx + 1]
+            X_neighbors_list.append(row_neighbor_features[window_row_indices])
+            neighbor_mask_list.append(row_neighbor_mask[window_row_indices])
+
             y_list.append(label_to_id[label_name])
 
             row = g.iloc[end_idx]
@@ -1234,27 +1519,41 @@ def build_lstm_windows(df, feature_cols, history_frames):
                 "future_intent_label_id": label_to_id[label_name],
             })
 
+        if track_idx % 500 == 0:
+            print(
+                f"Built windows for {track_idx}/{total_tracks} tracks; "
+                f"windows so far: {len(X_list)}",
+                flush=True,
+            )
+
     if len(X_list) == 0:
         raise RuntimeError("No LSTM windows were created. Check filters/history length.")
 
     X = np.stack(X_list, axis=0).astype(np.float32)
+    X_neighbors = np.stack(X_neighbors_list, axis=0).astype(np.float32)
+    neighbor_mask = np.stack(neighbor_mask_list, axis=0).astype(bool)
+
     y = np.array(y_list, dtype=np.int64)
     index_df = pd.DataFrame(index_rows)
 
-    return X, y, index_df
+    return X, X_neighbors, neighbor_mask, y, index_df
 
 
-X, y, window_index_df = build_lstm_windows(
+X, X_neighbors, neighbor_mask, y, window_index_df = build_lstm_windows(
     df=traj_df,
     feature_cols=LSTM_FEATURE_COLS,
     history_frames=HISTORY_FRAMES,
 )
 
-np.savez_compressed(
+save_lstm_npz = np.savez_compressed if SAVE_COMPRESSED_LSTM_NPZ else np.savez
+save_lstm_npz(
     LSTM_WINDOW_NPZ,
     X=X,
+    X_neighbors=X_neighbors,
+    neighbor_mask=neighbor_mask,
     y=y,
     feature_cols=np.array(LSTM_FEATURE_COLS),
+    neighbor_feature_cols=np.array(NEIGHBOR_FEATURE_COLS),
     label_names=np.array(LSTM_LABELS),
 )
 
@@ -1263,6 +1562,8 @@ window_index_df.to_csv(LSTM_WINDOW_INDEX_CSV, index=False)
 print(f"Saved LSTM window dataset: {LSTM_WINDOW_NPZ}")
 print(f"Saved LSTM window index: {LSTM_WINDOW_INDEX_CSV}")
 print(f"X shape: {X.shape}")
+print(f"X_neighbors shape: {X_neighbors.shape}")
+print(f"neighbor_mask shape: {neighbor_mask.shape}")
 print(f"y shape: {y.shape}")
 
 print("\nLSTM label distribution:")
@@ -1278,6 +1579,11 @@ print(f"Unique instances: {traj_df['instance_token'].nunique()}")
 
 print("\nCategory counts:")
 print(traj_df["category"].value_counts())
+
+if not RUN_CAMERA_PROJECTION:
+    print("\nSkipping camera projection because RUN_CAMERA_PROJECTION = False.")
+    print("\nDone.")
+    raise SystemExit(0)
 
 
 # ============================================================
